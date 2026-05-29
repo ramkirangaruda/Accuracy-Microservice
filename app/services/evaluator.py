@@ -6,6 +6,7 @@ import re
 from dotenv import load_dotenv
 from openai import OpenAI
 
+from app.services.heuristics import evaluate_heuristics
 from app.core.logger import logger
 
 load_dotenv()
@@ -15,9 +16,9 @@ client = OpenAI(
     base_url="https://api.groq.com/openai/v1",
 )
 
-# -----------------------------
+# ---------------------------------------------------
 # CONFIG
-# -----------------------------
+# ---------------------------------------------------
 
 JUDGE_MODEL = "llama-3.1-8b-instant"
 
@@ -25,12 +26,12 @@ JUDGE_MAX_RETRIES = 3
 JUDGE_BACKOFF_SECONDS = 2
 
 MAX_GENERATED_CHARS = 3000
-MAX_JUDGE_TOKENS = 400
+MAX_JUDGE_TOKENS = 500
 JUDGE_TIMEOUT_SECONDS = 20
 
-# -----------------------------
+# ---------------------------------------------------
 # HELPERS
-# -----------------------------
+# ---------------------------------------------------
 
 
 def safe_json_extract(text):
@@ -40,7 +41,6 @@ def safe_json_extract(text):
 
     cleaned = text.strip()
 
-    # remove markdown code fences
     if cleaned.startswith("```"):
         cleaned = (
             cleaned
@@ -51,36 +51,23 @@ def safe_json_extract(text):
 
     candidates = [cleaned]
 
-    # attempt object extraction
     object_match = re.search(r"\{[\s\S]+\}", cleaned)
-
-    # attempt array extraction
-    array_match = re.search(r"\[[\s\S]+\]", cleaned)
 
     if object_match:
         candidates.append(object_match.group())
 
-    if array_match:
-        candidates.append(array_match.group())
-
     for candidate in candidates:
 
-        # remove trailing commas
         candidate = re.sub(r",\s*([}\]])", r"\1", candidate)
 
         try:
 
             parsed = json.loads(candidate)
 
-            if isinstance(parsed, list):
-                return {
-                    "evaluation_items": parsed
-                }, None
-
             if isinstance(parsed, dict):
                 return parsed, None
 
-        except json.JSONDecodeError:
+        except Exception:
             continue
 
     return None, "Malformed JSON"
@@ -111,150 +98,179 @@ def is_timeout_error(exc: Exception) -> bool:
             "timeout",
             "timed out",
             "read timeout",
-            "request timed out",
         ]
     )
+
+
+def normalize_score(parsed: dict) -> int:
+
+    score = 100
+
+    if parsed.get("technical_correctness") == "partial":
+        score -= 20
+
+    if parsed.get("technical_correctness") == "no":
+        score -= 50
+
+    if parsed.get("automation_ready") == "partial":
+        score -= 15
+
+    if parsed.get("automation_ready") == "no":
+        score -= 35
+
+    if parsed.get("assertions_testable") == "partial":
+        score -= 15
+
+    if parsed.get("assertions_testable") == "no":
+        score -= 30
+
+    if parsed.get("oracle_correct") == "partial":
+        score -= 20
+
+    if parsed.get("oracle_correct") == "no":
+        score -= 40
+
+    realism = parsed.get("edge_case_realism")
+
+    if realism == "good":
+        score -= 5
+
+    elif realism == "partial":
+        score -= 15
+
+    elif realism == "poor":
+        score -= 30
+
+    return max(0, min(100, score))
+
+
+def ensure_list(value):
+
+    if isinstance(value, list):
+        return value
+
+    return []
 
 
 def build_failure_response(reason: str, latency_ms=None):
 
     return {
         "evaluation_status": "judge_failed",
-        "judge_model": JUDGE_MODEL,
-        "judge_latency_ms": latency_ms,
-
         "technical_correctness": "unknown",
         "automation_ready": "unknown",
         "assertions_testable": "unknown",
         "oracle_correct": "unknown",
         "edge_case_realism": "unknown",
-
         "summary": f"Judge failed: {reason}",
-
         "strengths": [],
-
         "weaknesses": [
             "Judge evaluation could not be completed"
         ],
-
         "critical_failures": [
             reason
         ],
-
         "suggested_tags": [
             "judge-failure"
-        ]
+        ],
+        "judge_latency_ms": latency_ms,
+        "judge_model": JUDGE_MODEL,
+        "overall_score": 0
     }
 
 
-# -----------------------------
-# MAIN EVALUATION FUNCTION
-# -----------------------------
+# ---------------------------------------------------
+# MAIN EVALUATION
+# ---------------------------------------------------
 
 
 def evaluate_output(scenario, generated_output):
 
     logger.info("Starting evaluation")
 
-    # defensive scenario handling
     scenario_name = scenario.get("name", "Unknown Scenario")
     feature = scenario.get("feature", "Unknown Feature")
     scenario_type = scenario.get("type", "Unknown Type")
     difficulty = scenario.get("difficulty", "Unknown")
 
-    # validate generated output
     if not generated_output or not generated_output.strip():
-
-        logger.warning("Generated output is empty")
 
         return {
             "evaluation_status": "invalid_input",
-
             "technical_correctness": "no",
             "automation_ready": "no",
             "assertions_testable": "no",
             "oracle_correct": "no",
             "edge_case_realism": "poor",
-
             "summary": "Generated output is empty.",
-
             "strengths": [],
-
             "weaknesses": [
                 "No generated test cases provided"
             ],
-
             "critical_failures": [
                 "Empty generated output"
             ],
-
             "suggested_tags": [
                 "invalid-input"
             ],
-
+            "judge_latency_ms": 0,
             "judge_model": JUDGE_MODEL,
-            "judge_latency_ms": 0
+            "overall_score": 0
         }
 
-    # prevent giant prompts
     generated_output = generated_output[:MAX_GENERATED_CHARS]
 
+    # ---------------------------------------------------
+    # HEURISTICS
+    # ---------------------------------------------------
+
+    heuristics = evaluate_heuristics(generated_output)
+
     prompt = f"""
-You are evaluating AI-generated software test cases.
+You are an extremely strict evaluator for AI-generated software test cases.
 
-Evaluate STRICTLY according to the rubric below.
+Your job is to detect weak, vague, manual-only, insecure, or non-automatable test cases.
 
-Scenario
+SCENARIO
+
 Name: {scenario_name}
 Feature: {feature}
 Type: {scenario_type}
 Difficulty: {difficulty}
 
-Generated Test Cases
+GENERATED TEST CASES
+
 {generated_output}
 
-Evaluation Rubric
+STRICT RULES
 
-technical_correctness
-- yes = technically accurate and semantically correct
-- partial = mostly correct but flawed assumptions
-- no = fundamentally incorrect
+A testcase WITHOUT:
+- explicit endpoint
+- request payload
+- expected response
+- assertions
 
-automation_ready
-- yes = directly scriptable with endpoints/payloads/assertions
-- partial = partially scriptable
-- no = manual QA only
+must NEVER receive high scores.
 
-assertions_testable
-- yes = machine-verifiable assertions
-- partial = vague assertions
-- no = not objectively testable
+Vague phrases like:
+- works correctly
+- verify functionality
+- behaves properly
+- looks good
 
-oracle_correct
-- yes = pass/fail logic correct
-- partial = weak/inconsistent
-- no = inverted/broken logic
+must be penalized heavily.
 
-edge_case_realism
-- excellent = production-grade
-- good = meaningful
-- partial = generic
-- poor = unrealistic
+Security exploits must NEVER be considered valid passing behavior.
 
-Important Rules
-- Penalize hallucinated endpoints/features
-- Penalize vague assertions
-- Penalize manual-only workflows
-- Penalize oracle inversion heavily
-- Reward executable payloads/endpoints/assertions
-- Reward realistic production edge cases
-- Security exploits should NEVER be treated as passing behavior
+Automation-ready means:
+- executable
+- machine-verifiable
+- deterministic
 
 Return ONLY valid JSON.
 
-Schema:
+JSON SCHEMA:
+
 {{
-    "evaluation_status": "success",
     "technical_correctness": "",
     "automation_ready": "",
     "assertions_testable": "",
@@ -267,8 +283,6 @@ Schema:
     "suggested_tags": []
 }}
 """
-
-    logger.info("[JUDGE] Using model: %s", JUDGE_MODEL)
 
     last_error = None
 
@@ -302,16 +316,95 @@ Schema:
 
             if parse_error:
 
-                logger.error("JSON parse failed: %s", parse_error)
-
                 return build_failure_response(
                     parse_error,
-                    latency_ms=latency_ms
+                    latency_ms
                 )
 
+            # ---------------------------------------------------
+            # SAFETY NORMALIZATION
+            # ---------------------------------------------------
+
+            parsed["strengths"] = ensure_list(
+                parsed.get("strengths")
+            )
+
+            parsed["weaknesses"] = ensure_list(
+                parsed.get("weaknesses")
+            )
+
+            parsed["critical_failures"] = ensure_list(
+                parsed.get("critical_failures")
+            )
+
+            parsed["suggested_tags"] = ensure_list(
+                parsed.get("suggested_tags")
+            )
+
             parsed["evaluation_status"] = "success"
+
             parsed["judge_latency_ms"] = latency_ms
             parsed["judge_model"] = JUDGE_MODEL
+
+            # ---------------------------------------------------
+            # BASE SCORE
+            # ---------------------------------------------------
+
+            base_score = normalize_score(parsed)
+
+            # ---------------------------------------------------
+            # APPLY HEURISTIC PENALTIES
+            # ---------------------------------------------------
+
+            final_score = max(
+                0,
+                base_score - heuristics["penalties"]
+            )
+
+            parsed["overall_score"] = final_score
+
+            # ---------------------------------------------------
+            # ADD HEURISTIC ISSUES
+            # ---------------------------------------------------
+
+            parsed["weaknesses"].extend(
+                heuristics["issues"]
+            )
+
+            # ---------------------------------------------------
+            # EXPLOIT OVERRIDE
+            # ---------------------------------------------------
+
+            if heuristics["exploit_detected"]:
+
+                parsed["technical_correctness"] = "no"
+
+                parsed["automation_ready"] = "no"
+
+                parsed["assertions_testable"] = "no"
+
+                parsed["oracle_correct"] = "no"
+
+                parsed["edge_case_realism"] = "poor"
+
+                parsed["overall_score"] = 0
+
+                parsed["critical_failures"].append(
+                    "Security exploit treated as passing behavior"
+                )
+
+                parsed["weaknesses"].append(
+                    "Security exploit treated as passing behavior"
+                )
+
+                parsed["suggested_tags"].extend([
+                    "security-exploit",
+                    "manual-only"
+                ])
+
+                parsed["summary"] = (
+                    "Security exploit treated as passing behavior"
+                )
 
             logger.info(
                 "Evaluation completed in %sms",
@@ -325,7 +418,7 @@ Schema:
             last_error = e
 
             logger.error(
-                "[JUDGE] Attempt %s failed: %s",
+                "Judge attempt %s failed: %s",
                 attempt,
                 str(e)
             )
@@ -335,12 +428,9 @@ Schema:
                 and attempt < JUDGE_MAX_RETRIES
             ):
 
-                logger.warning(
-                    "[JUDGE] Rate limit hit. Retrying in %ss",
+                time.sleep(
                     JUDGE_BACKOFF_SECONDS * attempt
                 )
-
-                time.sleep(JUDGE_BACKOFF_SECONDS * attempt)
 
                 continue
 
@@ -349,17 +439,12 @@ Schema:
                 and attempt < JUDGE_MAX_RETRIES
             ):
 
-                logger.warning(
-                    "[JUDGE] Timeout. Retrying in %ss",
+                time.sleep(
                     JUDGE_BACKOFF_SECONDS * attempt
                 )
-
-                time.sleep(JUDGE_BACKOFF_SECONDS * attempt)
 
                 continue
 
             break
-
-    logger.error("Judge completely failed")
 
     return build_failure_response(str(last_error))
