@@ -39,67 +39,114 @@ def safe_join_steps(steps):
     return safe_str(steps)
 
 
-def calculate_overall_score(evaluation: dict) -> int:
+def _normalize_label(value, default=""):
 
-    score = 0
+    if value is None:
+        return default
 
-    technical_map = {
-        "yes": 30,
-        "partial": 15,
-        "no": 0
+    return str(value).strip().lower()
+
+
+def _clamp_score(score: int) -> int:
+
+    return max(0, min(100, score))
+
+
+def get_score_band(score: int) -> str:
+
+    if score >= 90:
+        return "excellent"
+
+    if score >= 70:
+        return "usable"
+
+    if score >= 40:
+        return "weak"
+
+    return "reject"
+
+
+def get_quality_grade(score: int) -> str:
+    """
+    Map a 0-100 overall score to a letter grade.
+
+    Band definitions:
+      A  90-100  Excellent — automation-ready, explicit assertions, edge cases covered
+      B  75-89   Good — structured and mostly testable, minor gaps
+      C  55-74   Mid-quality — present but weak assertions or missing edge cases
+      D  30-54   Weak — structural skeleton only, assertions vague or absent
+      F   0-29   Garbage / exploit / empty — not testable in any meaningful way
+    """
+    if score >= 90:
+        return "A"
+
+    if score >= 75:
+        return "B"
+
+    if score >= 55:
+        return "C"
+
+    if score >= 30:
+        return "D"
+
+    return "F"
+
+
+def _coerce_dimension_score(value) -> int:
+
+    try:
+        score = int(value)
+    except (TypeError, ValueError):
+        return 0
+
+    return max(0, min(10, score))
+
+
+def calculate_overall_score(
+    evaluation: dict,
+    heuristic_penalties: float = 0.0,
+) -> int:
+
+    dimensions = evaluation.get("dimensions", {})
+    if not isinstance(dimensions, dict):
+        dimensions = {}
+
+    weights = {
+        "technical_correctness": 0.25,
+        "automation_ready": 0.20,
+        "assertions_testable": 0.20,
+        "oracle_correct": 0.20,
+        "edge_case_realism": 0.15,
     }
 
-    automation_map = {
-        "yes": 25,
-        "partial": 12,
-        "no": 0
-    }
+    weighted_sum = 0.0
 
-    assertions_map = {
-        "yes": 20,
-        "partial": 10,
-        "no": 0
-    }
+    for key, weight in weights.items():
+        dim = dimensions.get(key, {})
+        if isinstance(dim, dict):
+            raw_score = dim.get("score", 0)
+        else:
+            raw_score = 0
 
-    oracle_map = {
-        "yes": 15,
-        "partial": 7,
-        "no": 0
-    }
+        weighted_sum += _coerce_dimension_score(raw_score) * weight
 
-    edge_map = {
-        "excellent": 10,
-        "good": 7,
-        "partial": 4,
-        "poor": 0
-    }
+    base_score = round(weighted_sum * 10)
 
-    score += technical_map.get(
-        evaluation.get("technical_correctness", "no"),
-        0
-    )
+    penalties = 0
 
-    score += automation_map.get(
-        evaluation.get("automation_ready", "no"),
-        0
-    )
+    if _normalize_label(
+        evaluation.get("evaluation_status", ""),
+        ""
+    ) != "success":
+        penalties += 15
 
-    score += assertions_map.get(
-        evaluation.get("assertions_testable", "no"),
-        0
-    )
+    critical_failures = evaluation.get("critical_failures", [])
+    if isinstance(critical_failures, list) and critical_failures:
+        penalties += min(30, 10 * len(critical_failures))
 
-    score += oracle_map.get(
-        evaluation.get("oracle_correct", "no"),
-        0
-    )
+    penalties += int(round(heuristic_penalties))
 
-    score += edge_map.get(
-        evaluation.get("edge_case_realism", "poor"),
-        0
-    )
-
-    return score
+    return _clamp_score(base_score - penalties)
 
 
 def score(parsed: dict, feature: str, requested_count: int) -> dict:

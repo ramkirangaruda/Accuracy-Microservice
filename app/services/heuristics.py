@@ -2,20 +2,23 @@ import re
 
 
 def evaluate_heuristics(text: str) -> dict:
+
     text_lower = text.lower()
 
     penalties = 0
     issues = []
 
-    # -------------------------
-    # Missing endpoint
-    # -------------------------
+    # ---------------------------------------------------
+    # ENDPOINT DETECTION
+    # ---------------------------------------------------
+
     endpoint_patterns = [
         r"post\s+/",
         r"get\s+/",
         r"put\s+/",
         r"delete\s+/",
-        r"/api/"
+        r"patch\s+/",
+        r"/api/",
     ]
 
     has_endpoint = any(
@@ -24,18 +27,21 @@ def evaluate_heuristics(text: str) -> dict:
     )
 
     if not has_endpoint:
-        penalties += 20
+        penalties += 8
         issues.append("Missing explicit API endpoint")
 
-    # -------------------------
-    # Missing assertions
-    # -------------------------
+    # ---------------------------------------------------
+    # ASSERTION DETECTION
+    # ---------------------------------------------------
+
     assertion_keywords = [
         "assert",
         "expected",
-        "verify",
         "status",
-        "response"
+        "response contains",
+        "response time",
+        "status code",
+        "verify response",
     ]
 
     has_assertions = any(
@@ -44,37 +50,92 @@ def evaluate_heuristics(text: str) -> dict:
     )
 
     if not has_assertions:
-        penalties += 25
+        penalties += 10
         issues.append("Missing machine-verifiable assertions")
 
-    # -------------------------
-    # Vague wording
-    # -------------------------
+    # ---------------------------------------------------
+    # PAYLOAD DETECTION
+    # ---------------------------------------------------
+
+    payload_patterns = [
+        "{",
+        "payload",
+        "request body",
+        '"email"',
+        '"password"',
+    ]
+
+    has_payload = any(
+        pattern in text_lower
+        for pattern in payload_patterns
+    )
+
+    if not has_payload:
+        penalties += 6
+        issues.append("Missing request payload details")
+
+    # ---------------------------------------------------
+    # VAGUE WORDING
+    # ---------------------------------------------------
+
     vague_phrases = [
         "works correctly",
         "looks good",
         "user friendly",
         "verify functionality",
-        "behaves properly"
+        "behaves properly",
+        "works properly",
+        "functions correctly",
+        "displayed correctly",
     ]
 
-    found_vague = any(
-        phrase in text_lower
+    vague_matches = [
+        phrase
         for phrase in vague_phrases
-    )
+        if phrase in text_lower
+    ]
 
-    if found_vague:
-        penalties += 15
+    vague_match_count = len(vague_matches)
+
+    if vague_matches:
+        penalties += 5 * vague_match_count
         issues.append("Contains vague non-testable wording")
 
-    # -------------------------
-    # Security exploit normalization
-    # -------------------------
+    # ---------------------------------------------------
+    # EDGE CASE DETECTION
+    # ---------------------------------------------------
+
+    edge_case_keywords = [
+        "invalid",
+        "expired",
+        "empty",
+        "timeout",
+        "rate limit",
+        "401",
+        "403",
+        "404",
+        "500",
+    ]
+
+    has_edge_cases = any(
+        keyword in text_lower
+        for keyword in edge_case_keywords
+    )
+
+    # Reward realistic edge-case thinking
+    if has_edge_cases:
+        penalties -= 5
+
+    # ---------------------------------------------------
+    # SECURITY EXPLOIT DETECTION
+    # ---------------------------------------------------
+
     exploit_patterns = [
         "' or '1'='1",
         "sql injection",
         "bypass login",
-        "unauthorized access"
+        "unauthorized access is granted",
+        "successful exploit",
     ]
 
     exploit_detected = any(
@@ -82,10 +143,25 @@ def evaluate_heuristics(text: str) -> dict:
         for pattern in exploit_patterns
     )
 
+    if exploit_detected:
+        penalties += 100
+        issues.append("Security exploit treated as valid behavior")
+
+    # ---------------------------------------------------
+    # FINAL CLAMP
+    # ---------------------------------------------------
+
+    penalties = max(0, penalties)
+
     return {
         "penalties": penalties,
         "issues": issues,
         "has_endpoint": has_endpoint,
         "has_assertions": has_assertions,
-        "exploit_detected": exploit_detected
+        "has_payload": has_payload,
+        "has_edge_cases": has_edge_cases,
+        "exploit_detected": exploit_detected,
+        # Exposed so apply_heuristic_adjustments can scale
+        # the vague-wording penalty continuously instead of binary
+        "vague_match_count": vague_match_count,
     }

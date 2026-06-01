@@ -1,10 +1,12 @@
 from fastapi import APIRouter
+
 from app.schemas.response import EvaluationResponse
 from app.schemas.request import EvaluationRequest
+
 from app.services.evaluator import evaluate_output
-from app.services.scorer import calculate_overall_score
 
 router = APIRouter()
+
 
 @router.get("/health")
 async def health():
@@ -14,6 +16,7 @@ async def health():
         "service": "ai-testcase-validator",
         "judge_model": "llama-3.1-8b-instant"
     }
+
 
 @router.post(
     "/evaluate",
@@ -32,5 +35,5 @@ async def evaluate(req: EvaluationRequest):
         scenario,
         req.generated_output
     )
-    evaluation["overall_score"] = calculate_overall_score(evaluation)
+
     return evaluation

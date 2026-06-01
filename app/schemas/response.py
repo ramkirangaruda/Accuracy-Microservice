@@ -1,10 +1,12 @@
 from pydantic import BaseModel
-from typing import List
+from typing import Dict, List, Optional
 
 
 class EvaluationResponse(BaseModel):
 
     evaluation_status: str
+
+    dimensions: Dict[str, "DimensionScore"]
 
     technical_correctness: str
     automation_ready: str
@@ -19,8 +21,17 @@ class EvaluationResponse(BaseModel):
     critical_failures: List[str]
 
     suggested_tags: List[str]
+    adjustment_notes: List[str] = []
 
-    judge_latency_ms: int | None = None
-    judge_model: str | None = None
+    judge_latency_ms: Optional[int] = None
+    judge_model: Optional[str] = None
+    confidence: Optional[int] = None
 
-    overall_score: int | None = None
+    overall_score: int
+    quality_grade: Optional[str] = None
+
+
+class DimensionScore(BaseModel):
+
+    score: int
+    reason: str
